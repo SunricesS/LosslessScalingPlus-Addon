@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Lossless Scaling Plus — Local LSFG 3.1 Compute Shader Optimizer & Patcher
-=========================================================================
+Lossless Scaling Plus — Local LSFG 3.1/2.3 Compute Shader Optimizer & Patcher (V2.0)
+=================================================================================
 100% Clean-Room BYOB (Bring Your Own Binary) Local Optimizer.
 Contains ZERO proprietary shader code or weights.
 
 Reads the user's own legitimate Steam installation of `Lossless.dll`,
-extracts RT_RCDATA compute shaders (IDs 257..302) in memory, folds unfolded
-BatchNorm affine layers into single hardware `mad` instructions, strips
+extracts all 109 RT_RCDATA CNN compute shaders (6-UAV IDs 172..239 & 4-UAV IDs 257..302)
+in memory, transposes 4x4 Conv2D dot-product blocks into column-major `mad` chains,
+folds unfolded BatchNorm affine layers into single hardware `mad` instructions, strips
 `skipOptimization`, recompiles locally via Windows `D3DCompiler_47.dll` with
 `D3DCOMPILE_OPTIMIZATION_LEVEL3` (/O3), and updates `Lossless.dll` (preserving
 `Lossless.dll.bak`).
@@ -170,6 +171,72 @@ def select_swizzle(swiz, mask_indices):
     return ''.join(swiz[i] for i in mask_indices)
 
 
+def transpose_dp4_blocks(body_lines):
+    """
+    Transposes 4x4 row-major Conv2D dot-product blocks (4x mov + 4x dp4 [+ add])
+    into column-major broadcast multiply-add sequences so D3DCompile (/O3) emits
+    4 hardware `mad` instructions instead of 4 `dp4` + 1 `add` (20% fewer ALU slots).
+    """
+    out = []
+    i = 0
+    n = len(body_lines)
+    pat_mov = re.compile(r'^mov (r\d+)\.xyzw \{min16f\}, l\(([^)]+)\) \{def32 as min16f\}$')
+    pat_dp4 = re.compile(r'^dp4 (r\d+)\.([xyzw]) \{min16f\}, (r\d+)\.xyzw \{min16f\}, (r\d+)\.xyzw \{min16f\}$')
+    pat_add = re.compile(r'^add (r\d+)\.xyzw \{min16f\}, (r\d+)\.xyzw \{min16f\}, (r\d+)\.xyzw \{min16f\}$')
+    while i < n:
+        if i + 7 < n:
+            m0 = pat_mov.match(body_lines[i])
+            m1 = pat_mov.match(body_lines[i + 1])
+            m2 = pat_mov.match(body_lines[i + 2])
+            m3 = pat_mov.match(body_lines[i + 3])
+            d0 = pat_dp4.match(body_lines[i + 4])
+            d1 = pat_dp4.match(body_lines[i + 5])
+            d2 = pat_dp4.match(body_lines[i + 6])
+            d3 = pat_dp4.match(body_lines[i + 7])
+            if m0 and m1 and m2 and m3 and d0 and d1 and d2 and d3:
+                rA, rB, rC, rD = m0.group(1), m1.group(1), m2.group(1), m3.group(1)
+                if (d0.group(2), d1.group(2), d2.group(2), d3.group(2)) == ('x', 'y', 'z', 'w') and \
+                   (d0.group(4), d1.group(4), d2.group(4), d3.group(4)) == (rA, rB, rC, rD) and \
+                   d0.group(1) == d1.group(1) == d2.group(1) == d3.group(1) and \
+                   d0.group(3) == d1.group(3) == d2.group(3) == d3.group(3):
+                    rOut = d0.group(1)
+                    rIn = d0.group(3)
+                    rows = [
+                        [float(x.strip()) for x in m0.group(2).split(',')],
+                        [float(x.strip()) for x in m1.group(2).split(',')],
+                        [float(x.strip()) for x in m2.group(2).split(',')],
+                        [float(x.strip()) for x in m3.group(2).split(',')],
+                    ]
+                    cols = [[rows[r][c] for r in range(4)] for c in range(4)]
+                    c_strs = [", ".join(f"{v:.6f}" for v in col) for col in cols]
+                    swiz = ['xxxx', 'yyyy', 'zzzz', 'wwww']
+                    has_add = False
+                    if i + 8 < n:
+                        ma = pat_add.match(body_lines[i + 8])
+                        if ma and (ma.group(2) == rOut or ma.group(3) == rOut):
+                            has_add = True
+                            rDst = ma.group(1)
+                            rAcc = ma.group(3) if ma.group(2) == rOut else ma.group(2)
+                    if has_add:
+                        out.append(f"mul {rOut}.xyzw {{min16f}}, {rIn}.xxxx {{min16f}}, l({c_strs[0]}) {{def32 as min16f}}")
+                        out.append(f"add {rDst}.xyzw {{min16f}}, {rAcc}.xyzw {{min16f}}, {rOut}.xyzw {{min16f}}")
+                        for c_idx in range(1, 4):
+                            out.append(f"mul {rOut}.xyzw {{min16f}}, {rIn}.{swiz[c_idx]} {{min16f}}, l({c_strs[c_idx]}) {{def32 as min16f}}")
+                            out.append(f"add {rDst}.xyzw {{min16f}}, {rDst}.xyzw {{min16f}}, {rOut}.xyzw {{min16f}}")
+                        i += 9
+                        continue
+                    else:
+                        out.append(f"mul {rOut}.xyzw {{min16f}}, {rIn}.xxxx {{min16f}}, l({c_strs[0]}) {{def32 as min16f}}")
+                        for c_idx in range(1, 4):
+                            out.append(f"mul {rB}.xyzw {{min16f}}, {rIn}.{swiz[c_idx]} {{min16f}}, l({c_strs[c_idx]}) {{def32 as min16f}}")
+                            out.append(f"add {rOut}.xyzw {{min16f}}, {rOut}.xyzw {{min16f}}, {rB}.xyzw {{min16f}}")
+                        i += 8
+                        continue
+        out.append(body_lines[i])
+        i += 1
+    return out
+
+
 def fold_batchnorm_instructions(body_lines):
     new_lines = []
     i = 0
@@ -289,6 +356,7 @@ def transpile_asm_to_hlsl(asm_text, ultra_perf=False, shader_id=0):
             continue
         body_lines.append(l)
 
+    body_lines = transpose_dp4_blocks(body_lines)
     body_lines = fold_batchnorm_instructions(body_lines)
 
     reg_type = {(str(i), c): 'float' for i in range(num_temps) for c in 'xyzw'}
@@ -495,14 +563,14 @@ def transpile_asm_to_hlsl(asm_text, ultra_perf=False, shader_id=0):
             target = commit_dst(ops[0], want)
             sym = {'add': '+', 'mul': '*', 'div': '/'}[op]
             hlsl.append(f"{indent}{target} = {a} {sym} {b};")
-        elif op in ('max', 'min', 'dp4'):
+        elif op in ('max', 'min', 'dp4', 'dp3'):
             _, mask_indices, is_min16, _, _ = get_dst_info(ops[0])
             want = 'min16f' if is_min16 else 'float'
-            src_indices = [0, 1, 2, 3] if op == 'dp4' else mask_indices
+            src_indices = [0, 1, 2, 3] if op == 'dp4' else ([0, 1, 2] if op == 'dp3' else mask_indices)
             a = format_op(ops[1], src_indices, want)
             b = format_op(ops[2], src_indices, want)
             target = commit_dst(ops[0], want)
-            fn = 'dot' if op == 'dp4' else op
+            fn = 'dot' if op in ('dp4', 'dp3') else op
             hlsl.append(f"{indent}{target} = {fn}({a}, {b});")
         elif op == 'exp':
             _, mask_indices, is_min16, _, _ = get_dst_info(ops[0])
@@ -639,6 +707,22 @@ def compile_hlsl(hlsl_code):
     return dxbc, dis_text
 
 
+def apply_waitable_timer_spin_upgrade(dll_path):
+    try:
+        import struct
+        with open(dll_path, "r+b") as f:
+            f.seek(0x13FBB)
+            sig = f.read(8)
+            if sig == b"\xF2\x0F\x59\x05\x4D\xFE\x02\x00":
+                f.seek(0x43810)
+                val = struct.unpack("<d", f.read(8))[0]
+                if abs(val - (-2.0)) < 0.001:
+                    f.seek(0x43810)
+                    f.write(struct.pack("<d", -3.0))
+    except Exception:
+        pass
+
+
 def update_pe_checksum(dll_path):
     if not imagehlp:
         return
@@ -669,7 +753,10 @@ def patch_lossless_installation(install_dir, build_ultra_perf=True):
     else:
         print(f"[*] Reading original shaders from backup: {bak_path}")
 
-    shader_ids = list(range(257, 303))
+    ids_6uav = list(range(172, 181)) + list(range(182, 200)) + list(range(202, 220)) + list(range(222, 240))
+    ids_4uav = list(range(257, 303))
+    ids_6uav_set = set(ids_6uav)
+    shader_ids = ids_6uav + ids_4uav
     raw_resources = read_rcdata_resources(bak_path, shader_ids)
 
     def build_variant(dst_file, ultra_perf=False):
@@ -678,19 +765,28 @@ def patch_lossless_installation(install_dir, build_ultra_perf=True):
         if not h_upd:
             raise RuntimeError(f"BeginUpdateResourceW failed on {dst_file}: {ctypes.get_last_error()}")
 
-        orig_slots_total = 0
-        opt_slots_total = 0
+        orig_slots_6uav = 0
+        opt_slots_6uav = 0
+        orig_slots_4uav = 0
+        opt_slots_4uav = 0
         bytes_after = 0
 
         for sid in shader_ids:
             orig_asm = disassemble_dxbc(raw_resources[sid])
             m_o = re.search(r'Approximately (\d+) instruction slots used', orig_asm)
-            orig_slots_total += int(m_o.group(1)) if m_o else 0
+            orig_slots = int(m_o.group(1)) if m_o else 0
 
             hlsl = transpile_asm_to_hlsl(orig_asm, ultra_perf=ultra_perf, shader_id=sid)
             dxbc, opt_asm = compile_hlsl(hlsl)
             m_n = re.search(r'Approximately (\d+) instruction slots used', opt_asm)
-            opt_slots_total += int(m_n.group(1)) if m_n else 0
+            opt_slots = int(m_n.group(1)) if m_n else 0
+
+            if sid in ids_6uav_set:
+                orig_slots_6uav += orig_slots
+                opt_slots_6uav += opt_slots
+            else:
+                orig_slots_4uav += orig_slots
+                opt_slots_4uav += opt_slots
 
             buf = ctypes.create_string_buffer(dxbc, len(dxbc))
             ok = UpdateResourceW(
@@ -708,10 +804,18 @@ def patch_lossless_installation(install_dir, build_ultra_perf=True):
         if not EndUpdateResourceW(h_upd, False):
             raise RuntimeError(f"EndUpdateResourceW failed: {ctypes.get_last_error()}")
 
+        apply_waitable_timer_spin_upgrade(dst_file)
         update_pe_checksum(dst_file)
-        red = (1.0 - (opt_slots_total / max(orig_slots_total, 1))) * 100.0
-        mode_name = "UltraPerf (/O3 + BN + 5-Tap)" if ultra_perf else "Lossless (/O3 + BatchNorm Folded)"
-        print(f"[+] {os.path.basename(dst_file)} [{mode_name}]: {orig_slots_total:,} -> {opt_slots_total:,} instruction slots (-{red:.2f}%, {bytes_after:,} bytes)")
+        orig_slots_total = orig_slots_6uav + orig_slots_4uav
+        opt_slots_total = opt_slots_6uav + opt_slots_4uav
+        red_6 = (1.0 - (opt_slots_6uav / max(orig_slots_6uav, 1))) * 100.0
+        red_4 = (1.0 - (opt_slots_4uav / max(orig_slots_4uav, 1))) * 100.0
+        red_all = (1.0 - (opt_slots_total / max(orig_slots_total, 1))) * 100.0
+        mode_name = "UltraPerf V2 (/O3 + ColMajor MAD + BN + 5-Tap)" if ultra_perf else "Lossless V2 (/O3 + ColMajor MAD + BN)"
+        print(f"[+] {os.path.basename(dst_file)} [{mode_name}]:")
+        print(f"    - 6-UAV (172..239, 63 shaders): {orig_slots_6uav:,} -> {opt_slots_6uav:,} instruction slots (-{red_6:.2f}%)")
+        print(f"    - 4-UAV (257..302, 46 shaders): {orig_slots_4uav:,} -> {opt_slots_4uav:,} instruction slots (-{red_4:.2f}%)")
+        print(f"    - Combined Total (109 shaders): {orig_slots_total:,} -> {opt_slots_total:,} instruction slots (-{red_all:.2f}%, {bytes_after:,} bytes)")
 
     build_variant(dll_path, ultra_perf=False)
     if build_ultra_perf:

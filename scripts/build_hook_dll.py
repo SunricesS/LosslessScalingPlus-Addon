@@ -1,567 +1,275 @@
-import struct
 import os
-import ctypes
+import subprocess
+import tempfile
+import shutil
 
-def align(val, alignment):
-    return (val + alignment - 1) & ~(alignment - 1)
+HOOK_VERIFY_CPP = r'''
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <d3d11.h>
+#include <dxgi1_2.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <math.h>
 
-def build_hook_dll(out_path):
-    """
-    Builds a native x64 PE DLL (LosslessPlusHook.dll) with:
-      - .text section: DllMain, LosslessPlusInitShared, LosslessPlusNotifyPresent, LosslessPlusGetState,
-        and DXGI proxy wrappers (CreateDXGIFactory, CreateDXGIFactory1, CreateDXGIFactory2)
-      - .rdata section: Import Directory (KERNEL32.dll), Export Directory, UTF-16LE strings
-      - .data section: Global state pointers (g_hMapFile, g_pState, g_hFrameEvent, g_hSysDxgi, etc.)
-      - .reloc section: Base relocation table so ASLR works at any load address
-    """
-    IMAGE_BASE = 0x180000000
-    SECT_ALIGN = 0x1000
-    FILE_ALIGN = 0x200
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
 
-    # Layout RVAs:
-    # 0x1000: .text
-    # 0x2000: .rdata (IAT at 0x2000, Import Table, Export Table, Strings)
-    # 0x3000: .data (Globals)
-    # 0x4000: .reloc
+#pragma pack(push, 1)
+struct LosslessPlusSharedState {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t frameCount;
+    uint64_t lastPresentQpc;
+    uint64_t qpcFrequency;
+    uint32_t targetPid;
+    uint32_t flags;
+    uint32_t depthBufferDetected;
+    uint32_t uiPassDetected;
+    uint64_t targetFrameIntervalQpc;
+    uint64_t sharedTextureHandle;
+    uint64_t sharedTextureHandlePrev;
+    uint32_t frameWidth;
+    uint32_t frameHeight;
+    uint32_t frameFormat;
+    uint32_t swapChainHwnd;
+};
+#pragma pack(pop)
 
-    # Kernel32 imports at IAT RVA 0x2000 (8 bytes each):
-    imports = [
-        "CreateFileMappingW",       # 0: 0x2000
-        "MapViewOfFile",            # 1: 0x2008
-        "CreateEventW",             # 2: 0x2010
-        "SetEvent",                 # 3: 0x2018
-        "QueryPerformanceCounter",  # 4: 0x2020
-        "QueryPerformanceFrequency",# 5: 0x2028
-        "GetCurrentProcessId",      # 6: 0x2030
-        "LoadLibraryW",             # 7: 0x2038
-        "GetProcAddress",           # 8: 0x2040
+typedef HRESULT(WINAPI* PFN_CreateDXGIFactory1)(REFIID, void**);
+typedef BOOL(WINAPI* PFN_GetState)(LosslessPlusSharedState*);
+typedef uint64_t(WINAPI* PFN_SetTargetFps)(uint32_t);
+typedef uint32_t(WINAPI* PFN_SetLatencyFlags)(uint32_t, uint32_t);
+typedef BOOL(WINAPI* PFN_AutoHookD3D11)();
+typedef HRESULT(WINAPI* PFN_OpenSharedFrame)(ID3D11Device*, ID3D11Texture2D**, uint32_t*, uint32_t*, uint32_t*, uint64_t*);
+
+int main(int argc, char** argv) {
+    if (argc < 2) return 99;
+    HMODULE hHook = LoadLibraryA(argv[1]);
+    if (!hHook) { printf("FAIL: LoadLibrary(%s) err=%lu\n", argv[1], GetLastError()); return 1; }
+
+    auto pCreateFactory1  = (PFN_CreateDXGIFactory1)GetProcAddress(hHook, "CreateDXGIFactory1");
+    auto pGetState        = (PFN_GetState)GetProcAddress(hHook, "LosslessPlusGetState");
+    auto pSetFps          = (PFN_SetTargetFps)GetProcAddress(hHook, "LosslessPlusSetTargetFps");
+    auto pSetLatencyFlags = (PFN_SetLatencyFlags)GetProcAddress(hHook, "LosslessPlusSetLatencyFlags");
+    auto pAutoHook        = (PFN_AutoHookD3D11)GetProcAddress(hHook, "LosslessPlusAutoHookD3D11");
+    auto pOpenShared      = (PFN_OpenSharedFrame)GetProcAddress(hHook, "LosslessPlusOpenSharedFrame");
+
+    if (!pCreateFactory1 || !pGetState || !pSetFps || !pSetLatencyFlags || !pAutoHook || !pOpenShared) {
+        printf("FAIL: Missing exports\n");
+        return 2;
+    }
+    pSetLatencyFlags(1, 1);
+
+    // Create hidden window for SwapChain
+    WNDCLASSA wc = {};
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = "LSPVerifyWnd";
+    RegisterClassA(&wc);
+    HWND hWnd = CreateWindowA("LSPVerifyWnd", "LSPV3Test", WS_OVERLAPPEDWINDOW, 0, 0, 640, 360, NULL, NULL, wc.hInstance, NULL);
+
+    // Device #1 + SwapChain created through hooked CreateDXGIFactory1 (Tier 3 Test)
+    IDXGIFactory1* pFactory = NULL;
+    HRESULT hr = pCreateFactory1(__uuidof(IDXGIFactory1), (void**)&pFactory);
+    if (FAILED(hr) || !pFactory) { printf("FAIL: CreateDXGIFactory1 hr=0x%lx\n", hr); return 3; }
+
+    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+    ID3D11Device* pDev1 = NULL;
+    ID3D11DeviceContext* pCtx1 = NULL;
+    hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, &fl, 1, D3D11_SDK_VERSION, &pDev1, NULL, &pCtx1);
+    if (FAILED(hr)) {
+        hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0, &fl, 1, D3D11_SDK_VERSION, &pDev1, NULL, &pCtx1);
+    }
+    if (FAILED(hr) || !pDev1) { printf("FAIL: D3D11CreateDevice #1 hr=0x%lx\n", hr); return 4; }
+
+    DXGI_SWAP_CHAIN_DESC sd = {};
+    sd.BufferCount = 2;
+    sd.BufferDesc.Width = 640;
+    sd.BufferDesc.Height = 360;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow = hWnd;
+    sd.SampleDesc.Count = 1;
+    sd.Windowed = TRUE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+
+    IDXGISwapChain* pSwapChain = NULL;
+    hr = pFactory->CreateSwapChain(pDev1, &sd, &pSwapChain);
+    if (FAILED(hr) || !pSwapChain) { printf("FAIL: CreateSwapChain hr=0x%lx\n", hr); return 5; }
+
+    // Clear BackBuffer to RGBA (64/255, 128/255, 191/255, 1.0)
+    ID3D11Texture2D* pBB = NULL;
+    ID3D11RenderTargetView* pRtv = NULL;
+    pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&pBB);
+    pDev1->CreateRenderTargetView(pBB, NULL, &pRtv);
+    const float clearColor[4] = { 64.0f / 255.0f, 128.0f / 255.0f, 191.0f / 255.0f, 1.0f };
+    pCtx1->ClearRenderTargetView(pRtv, clearColor);
+    pCtx1->Flush();
+    pRtv->Release();
+    pBB->Release();
+
+    // Test Tier 2 + Tier 3 + Tier 4 automatically via SwapChain::Present
+    uint64_t interval60 = pSetFps(60);
+    pSwapChain->Present(0, 0);
+    // Second frame with slightly different color so Resize/DoubleBuffer toggle is tested too
+    pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&pBB);
+    pDev1->CreateRenderTargetView(pBB, NULL, &pRtv);
+    pCtx1->ClearRenderTargetView(pRtv, clearColor);
+    pCtx1->Flush();
+    pRtv->Release();
+    pBB->Release();
+    pSwapChain->Present(0, 0);
+
+    LosslessPlusSharedState st = {};
+    if (!pGetState(&st)) { printf("FAIL: LosslessPlusGetState\n"); return 6; }
+
+    // Verify Flip-Model upgrade and MaxFrameLatency == 1 on Device #1
+    DXGI_SWAP_CHAIN_DESC actualScDesc = {};
+    pSwapChain->GetDesc(&actualScDesc);
+    UINT maxLat = 99;
+    IDXGIDevice1* pDxgiDev1 = NULL;
+    if (SUCCEEDED(pDev1->QueryInterface(__uuidof(IDXGIDevice1), (void**)&pDxgiDev1)) && pDxgiDev1) {
+        pDxgiDev1->GetMaximumFrameLatency(&maxLat);
+        pDxgiDev1->Release();
+    }
+
+    printf("STATE: magic=0x%08X ver=0x%08X frames=%llu flags=0x%X res=%ux%u fmt=%u shm=0x%llX prev=0x%llX interval60=%llu swapEffect=%u maxLatency=%u\n",
+        st.magic, st.version, st.frameCount, st.flags,
+        st.frameWidth, st.frameHeight, st.frameFormat,
+        st.sharedTextureHandle, st.sharedTextureHandlePrev, interval60,
+        (unsigned)actualScDesc.SwapEffect, maxLat);
+
+    if (st.magic != 0x4C53502Bu || st.frameCount < 2 || (st.flags & 0x7Fu) != 0x7Fu || maxLat != 1 || actualScDesc.SwapEffect != DXGI_SWAP_EFFECT_FLIP_DISCARD || st.sharedTextureHandle == 0 || st.frameWidth != 640 || st.frameHeight != 360) {
+        printf("FAIL: Unexpected SharedState or Latency values\n");
+        return 7;
+    }
+
+    // Device #2: Separate D3D11 device opening the zero-copy shared texture (Tier 4 Test)
+    ID3D11Device* pDev2 = NULL;
+    ID3D11DeviceContext* pCtx2 = NULL;
+    hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, &fl, 1, D3D11_SDK_VERSION, &pDev2, NULL, &pCtx2);
+    if (FAILED(hr)) {
+        hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0, &fl, 1, D3D11_SDK_VERSION, &pDev2, NULL, &pCtx2);
+    }
+    if (FAILED(hr) || !pDev2) { printf("FAIL: D3D11CreateDevice #2 hr=0x%lx\n", hr); return 8; }
+
+    ID3D11Texture2D* pSharedTex2 = NULL;
+    uint32_t w = 0, h = 0, fmt = 0;
+    uint64_t qpc = 0;
+    hr = pOpenShared(pDev2, &pSharedTex2, &w, &h, &fmt, &qpc);
+    if (FAILED(hr) || !pSharedTex2) { printf("FAIL: LosslessPlusOpenSharedFrame hr=0x%lx\n", hr); return 9; }
+
+    D3D11_TEXTURE2D_DESC stgDesc = {};
+    stgDesc.Width = 1;
+    stgDesc.Height = 1;
+    stgDesc.MipLevels = 1;
+    stgDesc.ArraySize = 1;
+    stgDesc.Format = (DXGI_FORMAT)fmt;
+    stgDesc.SampleDesc.Count = 1;
+    stgDesc.Usage = D3D11_USAGE_STAGING;
+    stgDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+    ID3D11Texture2D* pStg = NULL;
+    hr = pDev2->CreateTexture2D(&stgDesc, NULL, &pStg);
+    if (FAILED(hr) || !pStg) { printf("FAIL: Create staging tex hr=0x%lx\n", hr); return 10; }
+
+    D3D11_BOX box = { 10, 10, 0, 11, 11, 1 };
+    pCtx2->CopySubresourceRegion(pStg, 0, 0, 0, 0, pSharedTex2, 0, &box);
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    hr = pCtx2->Map(pStg, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) { printf("FAIL: Map hr=0x%lx\n", hr); return 11; }
+
+    uint8_t* px = (uint8_t*)mapped.pData;
+    printf("DEV2_ZERO_COPY_PIXEL: RGBA=(%u, %u, %u, %u) (%ux%u, qpc=%llu)\n", px[0], px[1], px[2], px[3], w, h, qpc);
+    bool pixelMatch = (abs((int)px[0] - 64) <= 2 && abs((int)px[1] - 128) <= 2 && abs((int)px[2] - 191) <= 2 && px[3] >= 253);
+    pCtx2->Unmap(pStg, 0);
+
+    // Also test LosslessPlusAutoHookD3D11
+    BOOL autoOk = pAutoHook();
+    printf("AUTO_HOOK_D3D11: %d\n", autoOk);
+
+    pStg->Release();
+    pSharedTex2->Release();
+    pCtx2->Release();
+    pDev2->Release();
+    pSwapChain->Release();
+    pFactory->Release();
+    pCtx1->Release();
+    pDev1->Release();
+    DestroyWindow(hWnd);
+
+    if (!pixelMatch || !autoOk) {
+        printf("FAIL: Pixel mismatch or AutoHook failed\n");
+        return 12;
+    }
+    printf("ALL_TIER3_TIER4_HW_TESTS_PASSED\n");
+    return 0;
+}
+'''
+
+
+def find_vcvars64():
+    candidates = [
+        r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat",
+        r"C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat",
+        r"C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Auxiliary\Build\vcvars64.bat",
+        r"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat",
     ]
-    iat_rvas = {name: 0x2000 + i * 8 for i, name in enumerate(imports)}
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return None
 
-    # .data globals at RVA 0x3000:
-    # 0x3000: g_pState (uint64)
-    # 0x3008: g_hFrameEvent (uint64)
-    # 0x3010: g_hMapFile (uint64)
-    # 0x3018: g_hSysDxgi (uint64)
-    # 0x3020: g_pfnCreateDXGIFactory (uint64)
-    # 0x3028: g_pfnCreateDXGIFactory1 (uint64)
-    # 0x3030: g_pfnCreateDXGIFactory2 (uint64)
-    # 0x3040: qpc_temp (uint64)
-    # 0x3048: freq_temp (uint64)
-    DATA_PSTATE = 0x3000
-    DATA_HEVENT = 0x3008
-    DATA_HMAP   = 0x3010
-    DATA_HDXGI  = 0x3018
-    DATA_PFN_F0 = 0x3020
-    DATA_PFN_F1 = 0x3028
-    DATA_PFN_F2 = 0x3030
-    DATA_QPC    = 0x3040
-    DATA_FREQ   = 0x3048
 
-    # Fixed string RVAs in .rdata (starting at 0x2400):
-    STR_SHM_RVA   = 0x2400 # L"Local\\LosslessPlusSharedState"
-    STR_EVT_RVA   = 0x2450 # L"Local\\LosslessPlusFrameEvent"
-    STR_DXGI_RVA  = 0x24A0 # L"C:\\Windows\\System32\\dxgi.dll"
-    STR_F0_RVA    = 0x2500 # "CreateDXGIFactory"
-    STR_F1_RVA    = 0x2520 # "CreateDXGIFactory1"
-    STR_F2_RVA    = 0x2540 # "CreateDXGIFactory2"
-
-    code = bytearray()
-
-    def emit(b):
-        code.extend(b)
-
-    def cur_rva():
-        return 0x1000 + len(code)
-
-    def rip_disp(target_rva, instr_len, disp_offset_in_instr):
-        next_rip = cur_rva() + instr_len
-        return target_rva - next_rip
-
-    def emit_call_iat(func_name):
-        # FF 15 <disp32> (6 bytes)
-        disp = rip_disp(iat_rvas[func_name], 6, 2)
-        emit(b"\xFF\x15" + struct.pack("<i", disp))
-
-    def emit_lea_rcx_rip(target_rva):
-        # 48 8D 0D <disp32> (7 bytes)
-        disp = rip_disp(target_rva, 7, 3)
-        emit(b"\x48\x8D\x0D" + struct.pack("<i", disp))
-
-    def emit_lea_rdx_rip(target_rva):
-        # 48 8D 15 <disp32> (7 bytes)
-        disp = rip_disp(target_rva, 7, 3)
-        emit(b"\x48\x8D\x15" + struct.pack("<i", disp))
-
-    def emit_lea_r9_rip(target_rva):
-        # 4C 8D 0D <disp32> (7 bytes)
-        disp = rip_disp(target_rva, 7, 3)
-        emit(b"\x4C\x8D\x0D" + struct.pack("<i", disp))
-
-    def emit_mov_rax_rip(target_rva):
-        # 48 8B 05 <disp32> (7 bytes)
-        disp = rip_disp(target_rva, 7, 3)
-        emit(b"\x48\x8B\x05" + struct.pack("<i", disp))
-
-    def emit_mov_rip_rax(target_rva):
-        # 48 89 05 <disp32> (7 bytes)
-        disp = rip_disp(target_rva, 7, 3)
-        emit(b"\x48\x89\x05" + struct.pack("<i", disp))
-
-    # -------------------------------------------------------------
-    # Function 1: LosslessPlusInitShared() at RVA 0x1000
-    # -------------------------------------------------------------
-    fn_init_rva = cur_rva()
-    emit(b"\x48\x83\xEC\x38") # sub rsp, 0x38
-    emit_mov_rax_rip(DATA_PSTATE)
-    emit(b"\x48\x85\xC0")     # test rax, rax
-    emit(b"\x0F\x85\xB2\x00\x00\x00") # jnz .already_init (patched below)
-    jnz_patch_pos = len(code) - 4
-
-    # CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE(4), 0, 64, L"Local\\LosslessPlusSharedState")
-    emit(b"\x48\xC7\xC1\xFF\xFF\xFF\xFF") # mov rcx, -1
-    emit(b"\x31\xD2")                     # xor edx, edx
-    emit(b"\x41\xB8\x04\x00\x00\x00")     # mov r8d, 4
-    emit(b"\x45\x31\xC9")                 # xor r9d, r9d
-    emit(b"\xC7\x44\x24\x20\x40\x00\x00\x00") # mov dword ptr [rsp+0x20], 64
-    disp_shm = rip_disp(STR_SHM_RVA, 7, 3)
-    emit(b"\x48\x8D\x05" + struct.pack("<i", disp_shm)) # lea rax, [rip+STR_SHM]
-    emit(b"\x48\x89\x44\x24\x28")         # mov [rsp+0x28], rax
-    emit_call_iat("CreateFileMappingW")
-    emit(b"\x48\x85\xC0")                 # test rax, rax
-    emit(b"\x0F\x84\x90\x00\x00\x00")     # jz .fail
-    jz1_patch_pos = len(code) - 4
-    emit_mov_rip_rax(DATA_HMAP)
-
-    # MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS(0xF001F), 0, 0, 64)
-    emit(b"\x48\x89\xC1")                 # mov rcx, rax
-    emit(b"\xBA\x1F\x00\x0F\x00")         # mov edx, 0xF001F
-    emit(b"\x45\x31\xC0")                 # xor r8d, r8d
-    emit(b"\x45\x31\xC9")                 # xor r9d, r9d
-    emit(b"\x48\xC7\x44\x24\x20\x40\x00\x00\x00") # mov qword ptr [rsp+0x20], 64
-    emit_call_iat("MapViewOfFile")
-    emit(b"\x48\x85\xC0")                 # test rax, rax
-    emit(b"\x0F\x84\x60\x00\x00\x00")     # jz .fail
-    jz2_patch_pos = len(code) - 4
-    emit_mov_rip_rax(DATA_PSTATE)
-
-    # Populate magic ('LSP+' = 0x4C53502B) and version (0x00010000)
-    emit(b"\xC7\x00\x2B\x50\x53\x4C")     # mov dword ptr [rax], 0x4C53502B
-    emit(b"\xC7\x40\x04\x00\x00\x01\x00") # mov dword ptr [rax+4], 0x00010000
-    emit(b"\x83\x48\x24\x01")             # or dword ptr [rax+0x24], 1 (flags |= 1)
-
-    # QueryPerformanceFrequency(&freq_temp)
-    emit_lea_rcx_rip(DATA_FREQ)
-    emit_call_iat("QueryPerformanceFrequency")
-    emit_mov_rax_rip(DATA_PSTATE)
-    disp_f = rip_disp(DATA_FREQ, 7, 3)
-    emit(b"\x48\x8B\x0D" + struct.pack("<i", disp_f)) # mov rcx, [rip+DATA_FREQ]
-    emit(b"\x48\x89\x48\x18")             # mov [rax+0x18], rcx
-
-    # QueryPerformanceCounter(&qpc_temp)
-    emit_lea_rcx_rip(DATA_QPC)
-    emit_call_iat("QueryPerformanceCounter")
-    emit_mov_rax_rip(DATA_PSTATE)
-    disp_q = rip_disp(DATA_QPC, 7, 3)
-    emit(b"\x48\x8B\x0D" + struct.pack("<i", disp_q)) # mov rcx, [rip+DATA_QPC]
-    emit(b"\x48\x89\x48\x10")             # mov [rax+0x10], rcx
-
-    # GetCurrentProcessId()
-    emit_call_iat("GetCurrentProcessId")
-    disp_ps = rip_disp(DATA_PSTATE, 7, 3)
-    emit(b"\x48\x8B\x0D" + struct.pack("<i", disp_ps)) # mov rcx, [rip+DATA_PSTATE]
-    emit(b"\x89\x41\x20")                 # mov [rcx+0x20], eax (targetPid at offset 0x20)
-
-    # CreateEventW(NULL, FALSE, FALSE, L"Local\\LosslessPlusFrameEvent")
-    emit(b"\x31\xC9")                     # xor ecx, ecx
-    emit(b"\x31\xD2")                     # xor edx, edx
-    emit(b"\x45\x31\xC0")                 # xor r8d, r8d
-    emit_lea_r9_rip(STR_EVT_RVA)
-    emit_call_iat("CreateEventW")
-    emit_mov_rip_rax(DATA_HEVENT)
-
-    # .already_init:
-    already_init_pos = len(code)
-    struct.pack_into("<i", code, jnz_patch_pos, already_init_pos - (jnz_patch_pos + 4))
-    emit(b"\xB8\x01\x00\x00\x00")         # mov eax, 1
-    emit(b"\x48\x83\xC4\x38")             # add rsp, 0x38
-    emit(b"\xC3")                         # ret
-
-    # .fail:
-    fail_pos = len(code)
-    struct.pack_into("<i", code, jz1_patch_pos, fail_pos - (jz1_patch_pos + 4))
-    struct.pack_into("<i", code, jz2_patch_pos, fail_pos - (jz2_patch_pos + 4))
-    emit(b"\x31\xC0")                     # xor eax, eax
-    emit(b"\x48\x83\xC4\x38")             # add rsp, 0x38
-    emit(b"\xC3")                         # ret
-
-    # Align to 16 bytes
-    while len(code) % 16 != 0:
-        emit(b"\xCC")
-
-    # -------------------------------------------------------------
-    # Function 2: LosslessPlusNotifyPresent(uint32_t depth, uint32_t ui)
-    # -------------------------------------------------------------
-    fn_notify_rva = cur_rva()
-    emit(b"\x53")                         # push rbx
-    emit(b"\x56")                         # push rsi
-    emit(b"\x48\x83\xEC\x28")             # sub rsp, 0x28
-    emit(b"\x89\xCB")                     # mov ebx, ecx (depthDetected)
-    emit(b"\x89\xD6")                     # mov esi, edx (uiDetected)
-    emit_mov_rax_rip(DATA_PSTATE)
-    emit(b"\x48\x85\xC0")                 # test rax, rax
-    emit(b"\x75\x09")                     # jnz .have_state (5 + 2 + 2 = 9 bytes)
-    # call LosslessPlusInitShared
-    disp_init = fn_init_rva - (cur_rva() + 5)
-    emit(b"\xE8" + struct.pack("<i", disp_init))
-    emit(b"\x85\xC0")                     # test eax, eax
-    emit(b"\x74\x42")                     # jz .notify_fail
-    jz_nfail_pos = len(code) - 1
-    # .have_state:
-    emit_lea_rcx_rip(DATA_QPC)
-    emit_call_iat("QueryPerformanceCounter")
-    emit_mov_rax_rip(DATA_PSTATE)
-    disp_q2 = rip_disp(DATA_QPC, 7, 3)
-    emit(b"\x48\x8B\x0D" + struct.pack("<i", disp_q2))
-    emit(b"\x48\x89\x48\x10")             # mov [rax+0x10], rcx (lastPresentQpc)
-    emit(b"\x89\x58\x28")                 # mov [rax+0x28], ebx (depthBufferDetected)
-    emit(b"\x89\x70\x2C")                 # mov [rax+0x2C], esi (uiPassDetected)
-    emit(b"\x48\xFF\x40\x08")             # inc qword ptr [rax+0x08] (frameCount)
-    emit(b"\x48\x8B\x58\x08")             # mov rbx, [rax+0x08]
-    # SetEvent(g_hFrameEvent)
-    disp_ev = rip_disp(DATA_HEVENT, 7, 3)
-    emit(b"\x48\x8B\x0D" + struct.pack("<i", disp_ev))
-    emit(b"\x48\x85\xC9")                 # test rcx, rcx
-    emit(b"\x74\x06")                     # jz .skip_ev (6 bytes for call_iat)
-    emit_call_iat("SetEvent")
-    # .skip_ev:
-    emit(b"\x48\x89\xD8")                 # mov rax, rbx
-    emit(b"\x48\x83\xC4\x28")             # add rsp, 0x28
-    emit(b"\x5E")                         # pop rsi
-    emit(b"\x5B")                         # pop rbx
-    emit(b"\xC3")                         # ret
-    # .notify_fail:
-    code[jz_nfail_pos] = len(code) - (jz_nfail_pos + 1)
-    emit(b"\x31\xC0")                     # xor eax, eax
-    emit(b"\x48\x83\xC4\x28")             # add rsp, 0x28
-    emit(b"\x5E")                         # pop rsi
-    emit(b"\x5B")                         # pop rbx
-    emit(b"\xC3")                         # ret
-
-    while len(code) % 16 != 0:
-        emit(b"\xCC")
-
-    # -------------------------------------------------------------
-    # Function 3: LosslessPlusGetState(LosslessPlusSharedState* out)
-    # -------------------------------------------------------------
-    fn_getstate_rva = cur_rva()
-    emit(b"\x53")                         # push rbx
-    emit(b"\x48\x83\xEC\x20")             # sub rsp, 0x20
-    emit(b"\x48\x85\xC9")                 # test rcx, rcx
-    emit(b"\x74\x00")                     # jz .gs_fail
-    jz_gs1_pos = len(code) - 1
-    emit(b"\x48\x89\xCB")                 # mov rbx, rcx
-    emit_mov_rax_rip(DATA_PSTATE)
-    emit(b"\x48\x85\xC0")                 # test rax, rax
-    emit(b"\x75\x10")                     # jnz .gs_copy (5 + 2 + 2 + 7 = 16 bytes)
-    disp_init2 = fn_init_rva - (cur_rva() + 5)
-    emit(b"\xE8" + struct.pack("<i", disp_init2))
-    emit(b"\x85\xC0")                     # test eax, eax
-    emit(b"\x74\x00")                     # jz .gs_fail
-    jz_gs2_pos = len(code) - 1
-    emit_mov_rax_rip(DATA_PSTATE)
-    # .gs_copy: copy 56 bytes (7 qwords) from [rax] to [rbx]
-    for off in range(0, 56, 8):
-        emit(b"\x48\x8B\x48" + struct.pack("<B", off)) # mov rcx, [rax+off]
-        emit(b"\x48\x89\x4B" + struct.pack("<B", off)) # mov [rbx+off], rcx
-    emit(b"\xB8\x01\x00\x00\x00")         # mov eax, 1
-    emit(b"\x48\x83\xC4\x20")             # add rsp, 0x20
-    emit(b"\x5B")                         # pop rbx
-    emit(b"\xC3")                         # ret
-    # .gs_fail:
-    gs_fail_pos = len(code)
-    code[jz_gs1_pos] = gs_fail_pos - (jz_gs1_pos + 1)
-    code[jz_gs2_pos] = gs_fail_pos - (jz_gs2_pos + 1)
-    emit(b"\x31\xC0")                     # xor eax, eax
-    emit(b"\x48\x83\xC4\x20")             # add rsp, 0x20
-    emit(b"\x5B")                         # pop rbx
-    emit(b"\xC3")                         # ret
-
-    while len(code) % 16 != 0:
-        emit(b"\xCC")
-
-    # -------------------------------------------------------------
-    # Function 4: DllMain(hinstDLL, fdwReason, lpvReserved)
-    # -------------------------------------------------------------
-    fn_dllmain_rva = cur_rva()
-    emit(b"\x48\x83\xEC\x28")             # sub rsp, 0x28
-    emit(b"\x83\xFA\x01")                 # cmp edx, 1 (DLL_PROCESS_ATTACH)
-    emit(b"\x75\x05")                     # jnz .dm_done
-    disp_init3 = fn_init_rva - (cur_rva() + 5)
-    emit(b"\xE8" + struct.pack("<i", disp_init3))
-    # .dm_done:
-    emit(b"\xB8\x01\x00\x00\x00")         # mov eax, 1
-    emit(b"\x48\x83\xC4\x28")             # add rsp, 0x28
-    emit(b"\xC3")                         # ret
-
-    while len(code) % 16 != 0:
-        emit(b"\xCC")
-
-    # -------------------------------------------------------------
-    # Function 5/6/7: DXGI Proxy Exports (CreateDXGIFactory, CreateDXGIFactory1, CreateDXGIFactory2)
-    # Loads C:\Windows\System32\dxgi.dll on demand, notifies frame init, and forwards call
-    # -------------------------------------------------------------
-    def build_dxgi_forwarder(str_fn_rva, pfn_cache_rva):
-        rva = cur_rva()
-        emit(b"\x48\x89\x4C\x24\x08")     # mov [rsp+8], rcx
-        emit(b"\x48\x89\x54\x24\x10")     # mov [rsp+16], rdx
-        emit(b"\x4C\x89\x44\x24\x18")     # mov [rsp+24], r8
-        emit(b"\x48\x83\xEC\x28")         # sub rsp, 0x28
-        disp_init_f = fn_init_rva - (cur_rva() + 5)
-        emit(b"\xE8" + struct.pack("<i", disp_init_f))
-        emit_mov_rax_rip(pfn_cache_rva)
-        emit(b"\x48\x85\xC0")             # test rax, rax
-        emit(b"\x75\x00")                 # jnz .have_pfn
-        jnz_pfn_pos = len(code) - 1
-        emit_mov_rax_rip(DATA_HDXGI)
-        emit(b"\x48\x85\xC0")             # test rax, rax
-        emit(b"\x75\x00")                 # jnz .have_hmod
-        jnz_hmod_pos = len(code) - 1
-        emit_lea_rcx_rip(STR_DXGI_RVA)
-        emit_call_iat("LoadLibraryW")
-        emit_mov_rip_rax(DATA_HDXGI)
-        # .have_hmod:
-        code[jnz_hmod_pos] = len(code) - (jnz_hmod_pos + 1)
-        emit(b"\x48\x89\xC1")             # mov rcx, rax
-        emit_lea_rdx_rip(str_fn_rva)
-        emit_call_iat("GetProcAddress")
-        emit_mov_rip_rax(pfn_cache_rva)
-        # .have_pfn:
-        code[jnz_pfn_pos] = len(code) - (jnz_pfn_pos + 1)
-        emit(b"\x48\x8B\x4C\x24\x30")     # mov rcx, [rsp+0x30]
-        emit(b"\x48\x8B\x54\x24\x38")     # mov rdx, [rsp+0x38]
-        emit(b"\x4C\x8B\x44\x24\x40")     # mov r8,  [rsp+0x40]
-        emit(b"\x48\x83\xC4\x28")         # add rsp, 0x28
-        emit(b"\x48\xFF\xE0")             # jmp rax
-        while len(code) % 16 != 0:
-            emit(b"\xCC")
-        return rva
-
-    fn_dxgi0_rva = build_dxgi_forwarder(STR_F0_RVA, DATA_PFN_F0)
-    fn_dxgi1_rva = build_dxgi_forwarder(STR_F1_RVA, DATA_PFN_F1)
-    fn_dxgi2_rva = build_dxgi_forwarder(STR_F2_RVA, DATA_PFN_F2)
-
-    # Optional verification of generated x86_64 instructions with Capstone
-    try:
-        import capstone
-        md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-        insns = list(md.disasm(bytes(code), IMAGE_BASE + 0x1000))
-        print(f"Assembled .text section: {len(code)} bytes ({len(insns)} instructions verified by Capstone)")
-    except ImportError:
-        print(f"Assembled .text section: {len(code)} bytes")
-
-    # Build .rdata section (at RVA 0x2000, size 0x1000)
-    rdata = bytearray(0x1000)
-
-    # 1. IAT at 0x2000 (0x000 in rdata) and ILT at 0x2080 (0x080 in rdata)
-    # Hint/Name entries starting at 0x2100
-    hn_off = 0x100
-    for i, name in enumerate(imports):
-        rva_hn = 0x2000 + hn_off
-        struct.pack_into("<Q", rdata, i * 8, rva_hn)         # IAT
-        struct.pack_into("<Q", rdata, 0x80 + i * 8, rva_hn)  # ILT
-        nb = name.encode("ascii") + b"\x00"
-        struct.pack_into("<H", rdata, hn_off, 0)             # Hint = 0
-        rdata[hn_off + 2 : hn_off + 2 + len(nb)] = nb
-        hn_off = align(hn_off + 2 + len(nb), 2)
-
-    # DLL name "KERNEL32.dll"
-    k32_name_rva = 0x2000 + hn_off
-    rdata[hn_off : hn_off + 13] = b"KERNEL32.dll\x00"
-
-    # Import Descriptor at 0x2200 (0x200 in rdata)
-    IMPORT_DIR_RVA = 0x2200
-    struct.pack_into("<IIIII", rdata, 0x200,
-        0x2080,       # OriginalFirstThunk (ILT RVA)
-        0,            # TimeDateStamp
-        0,            # ForwarderChain
-        k32_name_rva, # Name RVA
-        0x2000        # FirstThunk (IAT RVA)
-    )
-    # Null Import Descriptor at 0x2214
-
-    # 2. Export Directory at 0x2240 (0x240 in rdata)
-    EXPORT_DIR_RVA = 0x2240
-    exports = [
-        ("CreateDXGIFactory", fn_dxgi0_rva),
-        ("CreateDXGIFactory1", fn_dxgi1_rva),
-        ("CreateDXGIFactory2", fn_dxgi2_rva),
-        ("LosslessPlusGetState", fn_getstate_rva),
-        ("LosslessPlusInitShared", fn_init_rva),
-        ("LosslessPlusNotifyPresent", fn_notify_rva),
-    ]
-    exports.sort(key=lambda x: x[0]) # Must be sorted lexically for binary search!
-    num_exp = len(exports)
-
-    eat_off = 0x280
-    enpt_off = 0x2B0
-    eord_off = 0x2E0
-    ename_off = 0x300
-
-    dll_exp_name = b"LosslessPlusHook.dll\x00"
-    rdata[ename_off : ename_off + len(dll_exp_name)] = dll_exp_name
-    dll_exp_name_rva = 0x2000 + ename_off
-    ename_off += len(dll_exp_name)
-
-    for i, (ename, erva) in enumerate(exports):
-        struct.pack_into("<I", rdata, eat_off + i * 4, erva)
-        struct.pack_into("<I", rdata, enpt_off + i * 4, 0x2000 + ename_off)
-        struct.pack_into("<H", rdata, eord_off + i * 2, i)
-        eb = ename.encode("ascii") + b"\x00"
-        rdata[ename_off : ename_off + len(eb)] = eb
-        ename_off += len(eb)
-
-    struct.pack_into("<IIHHIIIIIII", rdata, 0x240,
-        0,                  # Characteristics
-        0,                  # TimeDateStamp
-        1, 0,               # MajorVersion, MinorVersion
-        dll_exp_name_rva,   # Name RVA
-        1,                  # Base ordinal
-        num_exp,            # NumberOfFunctions
-        num_exp,            # NumberOfNames
-        0x2000 + eat_off,   # AddressOfFunctions RVA
-        0x2000 + enpt_off,  # AddressOfNames RVA
-        0x2000 + eord_off   # AddressOfNameOrdinals RVA
-    )
-
-    # 3. Fixed Strings at 0x2400+
-    def put_wstr(rva, s):
-        off = rva - 0x2000
-        b = s.encode("utf-16le") + b"\x00\x00"
-        rdata[off : off + len(b)] = b
-
-    def put_astr(rva, s):
-        off = rva - 0x2000
-        b = s.encode("ascii") + b"\x00"
-        rdata[off : off + len(b)] = b
-
-    put_wstr(STR_SHM_RVA, r"Local\LosslessPlusSharedState")
-    put_wstr(STR_EVT_RVA, r"Local\LosslessPlusFrameEvent")
-    put_wstr(STR_DXGI_RVA, r"C:\Windows\System32\dxgi.dll")
-    put_astr(STR_F0_RVA, "CreateDXGIFactory")
-    put_astr(STR_F1_RVA, "CreateDXGIFactory1")
-    put_astr(STR_F2_RVA, "CreateDXGIFactory2")
-
-    # Build .data section (at RVA 0x3000)
-    data_sec = bytearray(0x200)
-
-    # Build .reloc section (at RVA 0x4000, empty single dummy block so loader allows ASLR)
-    reloc_sec = bytearray(0x200)
-    struct.pack_into("<IIHH", reloc_sec, 0, 0x3000, 12, 0, 0) # IMAGE_REL_BASED_ABSOLUTE padding
-
-    # Build DOS Header + PE64 Headers (0x400 bytes)
-    headers = bytearray(0x400)
-    headers[0:2] = b"MZ"
-    struct.pack_into("<I", headers, 0x3C, 0x80) # e_lfanew = 0x80
-
-    pe_off = 0x80
-    headers[pe_off : pe_off + 4] = b"PE\x00\x00"
-    # COFF File Header (20 bytes)
-    # Machine=0x8664 (AMD64), NumberOfSections=4, SizeOfOptionalHeader=0xF0, Characteristics=0x2022 (EXECUTABLE | LARGE_ADDRESS_AWARE | DLL)
-    struct.pack_into("<HHIIIHH", headers, pe_off + 4,
-        0x8664, 4, 0, 0, 0, 0xF0, 0x2022
-    )
-
-    opt_off = pe_off + 24
-    # Optional Header PE32+ (Magic=0x20B)
-    struct.pack_into("<HBBIIIIIQIIHHHHHHIIIIHHQQQQII", headers, opt_off,
-        0x20B,          # Magic (PE32+)
-        14, 0,          # Linker version
-        0x400,          # SizeOfCode
-        0x600,          # SizeOfInitializedData
-        0,              # SizeOfUninitializedData
-        fn_dllmain_rva, # AddressOfEntryPoint
-        0x1000,         # BaseOfCode
-        IMAGE_BASE,     # ImageBase
-        SECT_ALIGN,     # SectionAlignment
-        FILE_ALIGN,     # FileAlignment
-        6, 0,           # OS Version
-        0, 0,           # Image Version
-        6, 0,           # Subsystem Version
-        0,              # Win32VersionValue
-        0x5000,         # SizeOfImage
-        0x400,          # SizeOfHeaders
-        0,              # CheckSum
-        2,              # Subsystem (WINDOWS_GUI)
-        0x0160,         # DllCharacteristics (HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT)
-        0x100000, 0x1000, 0x100000, 0x1000, # Stack/Heap reserve & commit
-        0,              # LoaderFlags
-        16              # NumberOfRvaAndSizes
-    )
-
-    dd_off = opt_off + 112
-    # Data Directories:
-    # 0: Export Table
-    struct.pack_into("<II", headers, dd_off + 0 * 8, EXPORT_DIR_RVA, 40)
-    # 1: Import Table
-    struct.pack_into("<II", headers, dd_off + 1 * 8, IMPORT_DIR_RVA, 40)
-    # 5: Base Relocation Table
-    struct.pack_into("<II", headers, dd_off + 5 * 8, 0x4000, 12)
-    # 12: IAT
-    struct.pack_into("<II", headers, dd_off + 12 * 8, 0x2000, len(imports) * 8 + 8)
-
-    sec_off = opt_off + 0xF0
-    sections = [
-        # Name, VirtSize, VirtAddr, RawSize, RawPtr, Characteristics
-        (b".text\x00\x00\x00", len(code), 0x1000, 0x400, 0x400, 0x60000020),
-        (b".rdata\x00\x00", 0x600, 0x2000, 0x600, 0x800, 0x40000040),
-        (b".data\x00\x00\x00", 0x100, 0x3000, 0x200, 0xE00, 0xC0000040),
-        (b".reloc\x00\x00", 12,    0x4000, 0x200, 0x1000, 0x42000040),
-    ]
-    for i, (sname, vsize, vaddr, rsize, rptr, chars) in enumerate(sections):
-        off = sec_off + i * 40
-        headers[off : off + 8] = sname
-        struct.pack_into("<IIIIIIHHI", headers, off + 8,
-            vsize, vaddr, rsize, rptr, 0, 0, 0, 0, chars
-        )
-
-    text_padded = bytearray(0x400)
-    text_padded[:len(code)] = code
-
-    full_pe = headers + text_padded + rdata[:0x600] + data_sec + reloc_sec
-    with open(out_path, "wb") as f:
-        f.write(full_pe)
-
-    try:
-        import pefile
-        pe = pefile.PE(out_path, fast_load=True)
-        pe.OPTIONAL_HEADER.CheckSum = pe.generate_checksum()
-        pe.write(out_path)
-        pe.close()
-    except ImportError:
-        pass
-    print(f"Built native x64 {out_path} ({len(full_pe)} bytes)")
-
-if __name__ == "__main__":
+def build_and_verify():
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cpp_path = os.path.join(base_dir, "src", "hook", "LosslessPlusHook.cpp")
+    def_path = os.path.join(base_dir, "src", "hook", "LosslessPlusHook.def")
     out_dir = os.path.join(base_dir, "bin")
     os.makedirs(out_dir, exist_ok=True)
     dll_path = os.path.join(out_dir, "LosslessPlusHook.dll")
-    build_hook_dll(dll_path)
 
-    # Live runtime verification of LosslessPlusHook.dll!
-    hook = ctypes.WinDLL(dll_path)
-    hook.LosslessPlusInitShared.restype = ctypes.c_int
-    hook.LosslessPlusNotifyPresent.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
-    hook.LosslessPlusNotifyPresent.restype = ctypes.c_uint64
-    hook.LosslessPlusGetState.argtypes = [ctypes.c_void_p]
-    hook.LosslessPlusGetState.restype = ctypes.c_int
+    vcvars = find_vcvars64()
+    if not vcvars:
+        raise RuntimeError("Visual Studio 2022 vcvars64.bat not found!")
 
-    ok = hook.LosslessPlusInitShared()
-    fc1 = hook.LosslessPlusNotifyPresent(1, 1)
-    fc2 = hook.LosslessPlusNotifyPresent(1, 1)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        verify_cpp = os.path.join(tmpdir, "verify_hook.cpp")
+        verify_exe = os.path.join(tmpdir, "verify_hook.exe")
+        with open(verify_cpp, "w", encoding="utf-8") as f:
+            f.write(HOOK_VERIFY_CPP)
 
-    buf = ctypes.create_string_buffer(56)
-    hook.LosslessPlusGetState(buf)
-    magic, ver, frame_cnt, last_qpc, freq, pid, flags, depth_ok, ui_ok, interval = struct.unpack("<IIQQQIIIIQ", buf.raw)
-    print(f"LIVE HOOK VERIFICATION: magic={magic:#x} ('LSP+'), ver={ver:#x}, frameCount={frame_cnt}, qpc={last_qpc}, freq={freq}, pid={pid}, depth={depth_ok}, ui={ui_ok}")
+        bat_path = os.path.join(tmpdir, "build.bat")
+        with open(bat_path, "w", encoding="utf-8") as f:
+            f.write(f'@call "{vcvars}" >nul\r\n')
+            f.write(f'cl.exe /nologo /O2 /MT /EHsc /W3 /LD "{cpp_path}" /Fe:"{dll_path}" /Fo:"{tmpdir}\\hook.obj" /link /DEF:"{def_path}" /IMPLIB:"{tmpdir}\\hook.lib" /PDB:"{tmpdir}\\hook.pdb"\r\n')
+            f.write('if errorlevel 1 exit /b %errorlevel%\r\n')
+            f.write(f'cl.exe /nologo /O2 /MT /EHsc "{verify_cpp}" /Fe:"{verify_exe}" /Fo:"{tmpdir}\\verify.obj" /link /PDB:"{tmpdir}\\verify.pdb"\r\n')
+            f.write('if errorlevel 1 exit /b %errorlevel%\r\n')
+
+        res = subprocess.run(["cmd", "/c", bat_path], capture_output=True, text=True)
+        print(res.stdout.strip())
+        if res.returncode != 0:
+            print(res.stderr)
+            raise RuntimeError(f"MSVC build failed with code {res.returncode}")
+
+        # Clean up MSVC .exp / .lib from bin if created next to dll_path
+        for ext in (".exp", ".lib"):
+            leftover = os.path.splitext(dll_path)[0] + ext
+            if os.path.isfile(leftover):
+                os.remove(leftover)
+
+        print(f"Built native x64 {dll_path} ({os.path.getsize(dll_path):,} bytes)")
+
+        # Run real two-device D3D11 SwapChain + Zero-Copy Shared Texture test
+        v_res = subprocess.run([verify_exe, dll_path], capture_output=True, text=True)
+        print(v_res.stdout.strip())
+        if v_res.returncode != 0:
+            print(v_res.stderr)
+            raise RuntimeError(f"Hardware D3D11 verification failed with code {v_res.returncode}")
+
+
+if __name__ == "__main__":
+    build_and_verify()
